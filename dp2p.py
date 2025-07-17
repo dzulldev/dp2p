@@ -4,6 +4,7 @@ import os
 import random
 import time
 import uuid
+import re
 from datetime import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -13,36 +14,44 @@ from base64 import b64encode, b64decode
 PORT = 6666
 UDP_PORT = 7777
 BUFFER = 1024
+MAX_MESSAGE_LENGTH = 512
+VALID_CHAR_PATTERN = re.compile(r'^[\x20-\x7E\n\r\t]+$')
 
-AES_KEY = b'ThisIsASecretKey'  # 16 byte
+AES_KEY = b'ThisIsASecretKey'
 AES_MODE = AES.MODE_CBC
-IV = b'ThisIsAnInitVect'       # 16 byte
+IV = b'ThisIsAnInitVect'
 
 peers = {}
 lock = threading.Lock()
 message_history = set()
 
-# ====== UTILITIES ======
 
+# ====== UTILITIES ======
 def clear():
     os.system('clear' if os.name == 'posix' else 'cls')
+
 
 def random_name():
     return "anon" + str(random.randint(1000, 9999))
 
+
 def generate_msg_id():
     return str(uuid.uuid4())
+
 
 def timestamp():
     return time.strftime("[%H:%M:%S]")
 
+
 def print_connected(ip):
     print(f"\n{timestamp()} connected: {ip}\n<@{name}> ", end="", flush=True)
+
 
 def encrypt_msg(msg):
     cipher = AES.new(AES_KEY, AES_MODE, IV)
     ct_bytes = cipher.encrypt(pad(msg.encode(), AES.block_size))
     return b64encode(ct_bytes).decode()
+
 
 def decrypt_msg(enc_msg):
     try:
@@ -53,8 +62,12 @@ def decrypt_msg(enc_msg):
     except:
         return "[Decryption Failed]"
 
-# ====== PEER COMMUNICATION ======
 
+def is_valid_message(msg):
+    return len(msg) <= MAX_MESSAGE_LENGTH and VALID_CHAR_PATTERN.match(msg)
+
+
+# ====== PEER COMMUNICATION ======
 def send_all(msg_id, msg):
     enc = encrypt_msg(msg)
     with lock:
@@ -62,7 +75,8 @@ def send_all(msg_id, msg):
             try:
                 conn.sendall(f"{msg_id}|{enc}".encode())
             except:
-                continue
+                reconnect_peer(ip)
+
 
 def send_whisper(target_ip, msg):
     with lock:
@@ -74,17 +88,19 @@ def send_whisper(target_ip, msg):
                 conn.sendall(f"{msg_id}|{enc}".encode())
                 return True
             except:
-                return False
+                reconnect_peer(target_ip)
     return False
 
+
 def recv_from_peer(conn, addr):
+    ip = addr[0]
     while True:
         try:
             data = conn.recv(BUFFER)
             if not data:
                 break
 
-            raw = data.decode().strip()
+            raw = data.decode(errors='ignore').strip()
             if "|" not in raw:
                 continue
 
@@ -100,13 +116,13 @@ def recv_from_peer(conn, addr):
             break
 
     with lock:
-        for ip, peer_conn in list(peers.items()):
-            if peer_conn == conn:
-                del peers[ip]
+        if ip in peers:
+            del peers[ip]
     conn.close()
+    reconnect_peer(ip)
+
 
 # ====== SERVER SETUP ======
-
 def server_thread():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -120,26 +136,34 @@ def server_thread():
             with lock:
                 if ip not in peers:
                     peers[ip] = conn
-                    threading.Thread(target=recv_from_peer, args=(conn, addr), daemon=True).start()
-                    print_connected(ip)
+            threading.Thread(target=recv_from_peer, args=(conn, addr), daemon=True).start()
+            print_connected(ip)
         except:
             continue
+
 
 def connect_to_peer(ip):
     if ip == my_ip or ip in peers:
         return
     try:
         conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        conn.settimeout(3)
         conn.connect((ip, PORT))
+        conn.settimeout(None)
         with lock:
             peers[ip] = conn
         threading.Thread(target=recv_from_peer, args=(conn, (ip, PORT)), daemon=True).start()
         print_connected(ip)
     except:
-        print(f"\n{timestamp()} fail connect to {ip}\n<@{name}> ", end="", flush=True)
+        pass
+
+
+def reconnect_peer(ip):
+    time.sleep(2)
+    connect_to_peer(ip)
+
 
 # ====== BROADCAST DISCOVERY ======
-
 def udp_broadcast():
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -149,6 +173,7 @@ def udp_broadcast():
         except:
             pass
         time.sleep(5)
+
 
 def udp_listener():
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -163,8 +188,8 @@ def udp_listener():
         except:
             continue
 
-# ====== NETWORK HELPERS ======
 
+# ====== NETWORK HELPERS ======
 def get_my_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -176,8 +201,8 @@ def get_my_ip():
         s.close()
     return ip
 
-# ====== MAIN CHAT LOOP ======
 
+# ====== MAIN CHAT LOOP ======
 if __name__ == "__main__":
     clear()
     name = input("your name (leave blank for random): ").strip().lower()
@@ -201,7 +226,10 @@ if __name__ == "__main__":
                 print(f"<@{name}> ", end="", flush=True)
                 continue
 
-            if msg.startswith("/name "):
+            if not is_valid_message(msg):
+                print("Invalid message (too long or contains unsupported characters).")
+
+            elif msg.startswith("/name "):
                 name = msg.split(" ", 1)[1].strip().lower()
                 print(f"name changed to {name}")
 
@@ -209,9 +237,12 @@ if __name__ == "__main__":
                 parts = msg.split(" ", 2)
                 if len(parts) == 3:
                     ip, message = parts[1], parts[2]
-                    ok = send_whisper(ip, f"{timestamp()} <@{name}> (whisper): {message}")
-                    if not ok:
-                        print(f"fail whisper to {ip}")
+                    if is_valid_message(message):
+                        ok = send_whisper(ip, f"{timestamp()} <@{name}> (whisper): {message}")
+                        if not ok:
+                            print(f"fail whisper to {ip}")
+                    else:
+                        print("Invalid whisper message.")
 
             elif msg == "/peers":
                 print("connected peers:")
@@ -234,3 +265,7 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\nbye.")
             break
+
+        except Exception as e:
+            print(f"Error: {e}")
+            print(f"<@{name}> ", end="", flush=True)
